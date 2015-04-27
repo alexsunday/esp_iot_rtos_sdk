@@ -25,9 +25,11 @@
 #define DEFAULT_GWADDR "192.168.10.253"
 #define DHCP_BEGIN_ADDR "192.168.10.100"
 #define DHCP_END_ADDR "192.168.10.110"
+#define LOCAL_UDP_PORT 8090
 #define LOCAL_SERVER_PORT 8091
 #define CLOUD_SERVER "211.155.86.145"
 #define CLOUD_PORT 10090
+#define MAX_PACK_LENGTH 99
 
 
 enum DEV_TYPE {
@@ -50,7 +52,7 @@ typedef struct _rw_info{
 } rw_info;
 
 
-void raw_show(unsigned char* buf, size_t buflen)
+void ICACHE_FLASH_ATTR raw_show(unsigned char* buf, size_t buflen)
 {
 	int i = 0;
 	printf("*************************RAW_INFO*************************\n");
@@ -65,7 +67,7 @@ void raw_show(unsigned char* buf, size_t buflen)
 	printf("*************************RAW_INFO*************************\n");
 }
 
-void show_rw(rw_info* rw)
+void ICACHE_FLASH_ATTR show_rw(rw_info* rw)
 {
 	raw_show((unsigned char*) rw, sizeof(rw_info));
 	printf("Serv Addr: [%s]\n", inet_ntoa(rw->server_addr));
@@ -77,7 +79,7 @@ void show_rw(rw_info* rw)
 }
 
 
-void show_sysinfo()
+void ICACHE_FLASH_ATTR show_sysinfo()
 {
 	uint32 chipid = system_get_chip_id();
 	uint32 heepsize = system_get_free_heap_size();
@@ -97,7 +99,7 @@ void show_sysinfo()
 }
 
 
-void spi_flash_write_test(enum RUN_MODE mode)
+void ICACHE_FLASH_ATTR spi_flash_write_test(enum RUN_MODE mode)
 {
 	rw_info rw;
 	memset(&rw, 0, sizeof(rw));
@@ -129,7 +131,7 @@ void spi_flash_write_test(enum RUN_MODE mode)
 }
 
 
-void spi_flash_read_test()
+void ICACHE_FLASH_ATTR spi_flash_read_test()
 {
 	rw_info rw;
 	memset(&rw, 0, sizeof(rw));
@@ -144,11 +146,12 @@ void spi_flash_read_test()
 }
 
 
-void gpio_test(void* param)
+void ICACHE_FLASH_ATTR gpio_test(void* param)
 {
 	int pin = 0;
 
 	rw_info* rw = (rw_info*)param;
+	show_rw(rw);
 
 	if(rw->run_mode == CLIENT_ONLY) {
 		pin = BIT12;
@@ -171,7 +174,7 @@ void gpio_test(void* param)
 }
 
 
-void client_mode(void* param)
+void ICACHE_FLASH_ATTR client_mode(void* param)
 {
 	printf("CLIENT MODE\n");
 
@@ -201,7 +204,7 @@ void client_mode(void* param)
 		}
 		printf("Connected CLOUD :[%s:%d]\n", CLOUD_SERVER, CLOUD_PORT);
 		char* recv_buf = (char*)zalloc(128);
-		while((recvbytes = read(sta_socket, recv_buf, 128)) > 0) {
+		while((recvbytes = recv(sta_socket, recv_buf, 128, 0)) > 0) {
 			recv_buf[recvbytes] = 0;
 			printf("Data from CLIENT: [%d], [%s]\n", recvbytes, recv_buf);
 		}
@@ -218,7 +221,83 @@ void client_mode(void* param)
 }
 
 
-void wifi_mode(void* param)
+void ICACHE_FLASH_ATTR wifi_mode_client_conn(void* param)
+{
+	int left_bytes, has_recv;
+	int sock = (int)param;
+	char rcvbuf[100] = { 0 };
+	char* pcontent = NULL;
+
+	printf("wifi_mode_client_conn, sock: [%d]\n", sock);
+	while(1) {
+		printf("while ... while\n");
+		has_recv = recv(sock, rcvbuf, 1, 0);
+		printf("recv...recv\n");
+		if(has_recv <= 0) {
+			printf("disconnected...\n");
+			close(sock);
+			break;
+		}
+		printf("recv tcp head OK\n");
+
+		if(rcvbuf[0] > MAX_PACK_LENGTH) {
+			printf("head length large than %d\n", MAX_PACK_LENGTH);
+			close(sock);
+			break;
+		}
+		printf("tcp head length OK\n");
+
+		pcontent = rcvbuf + 1;
+		left_bytes = rcvbuf[0] - 1;
+		has_recv = 0;
+
+		printf("will recv while\n");
+		while(left_bytes) {
+			has_recv = recv(sock, pcontent + has_recv, left_bytes, 0);
+			if(has_recv <= 0) {
+				printf("disconnected...\n");
+				break;
+			}
+			left_bytes -= has_recv;
+		}
+
+		if(has_recv <= 0) {
+			close(sock);
+			break;
+		}
+
+		printf("data pack judge\n");
+		switch(pcontent[0])
+		{
+		case 1:
+			//HEARTBEAT
+			printf("Heart beat req\n");
+			rcvbuf[0] = 2;
+			rcvbuf[1] = 5;
+			send(sock, rcvbuf, 2, 0);
+			break;
+		case 8:
+			//LED TEST
+			printf("RECV LED TEST\n");
+			rcvbuf[0] = 2;
+			rcvbuf[1] = 9;
+			send(sock, rcvbuf, 2, 0);
+			break;
+		case 10:
+			//SET SSID
+			break;
+		default:
+			break;
+		}
+
+		vTaskDelay(10 / portTICK_RATE_MS);
+	}
+
+	vTaskDelete(NULL);
+}
+
+
+void ICACHE_FLASH_ATTR wifi_mode(void* param)
 {
 	while(1) {
 		struct sockaddr_in server_addr, client_addr;
@@ -251,7 +330,7 @@ void wifi_mode(void* param)
 				printf("listen error\n");
 				break;
 			}
-			printf("socket listen ok");
+			printf("socket listen ok\n");
 			sin_size = sizeof(client_addr);
 
 			for(;;) {
@@ -260,24 +339,83 @@ void wifi_mode(void* param)
 					printf("accept error\n");
 					continue;
 				}
+				printf("New connection from sock:[%d], addr: [%s:%d]\n", client_sock, inet_ntoa(client_addr.sin_addr), htons(client_addr.sin_port));
 
-				printf("New connection from [%s:%d]\n", inet_ntoa(client_addr.sin_addr), htons(client_addr.sin_port));
-				char* recv_buf = (char*)zalloc(128);
-				while((recvbytes = read(client_sock, recv_buf, 128)) > 0) {
-					recv_buf[recvbytes] = 0;
-					printf("RECV: [%d], [%s]\n", recvbytes, recv_buf);
-				}
-				free(recv_buf);
-
-				if(recvbytes <= 0) {
-					printf("disconnected...\n");
-					close(client_sock);
-				}
+				xTaskCreate(wifi_mode_client_conn, "wifi_mode_client_conn", 128, (void*)client_sock, 0, NULL);
 			}
 
 		} while(0);
 
 		vTaskDelay(1000 / portTICK_RATE_MS);
+	}
+
+	vTaskDelete(NULL);
+}
+
+
+void ICACHE_FLASH_ATTR udp_boardcast(void* param)
+{
+	while(1) {
+		int opt = 1;
+		int iRet = 0;
+		int sock = 0;
+		struct sockaddr_in addrto, addrfrom;
+
+		memset(&addrto, 0, sizeof(struct sockaddr_in));
+		memset(&addrfrom, 0, sizeof(struct sockaddr_in));
+
+		addrto.sin_family = AF_INET;
+		addrto.sin_addr.s_addr = htonl(INADDR_ANY);
+		addrto.sin_port = htons(LOCAL_UDP_PORT);
+
+		addrfrom.sin_family = AF_INET;
+		addrfrom.sin_addr.s_addr = htonl(INADDR_ANY);
+		addrfrom.sin_port = htons(LOCAL_UDP_PORT);
+
+		do {
+			sock = socket(AF_INET, SOCK_DGRAM, 0);
+			if(sock == -1) {
+				printf("udp socket init error\n");
+				break;
+			}
+			printf("udp socket init ok\n");
+
+			iRet = setsockopt(sock, SOL_SOCKET, SO_BROADCAST, (char*)&opt, sizeof(opt));
+			if(iRet == -1) {
+				printf("udp setsockopt error\n");
+				break;
+			}
+			printf("udp set socket opt ok\n");
+
+			iRet = bind(sock, (struct sockaddr*)&addrto, sizeof(struct sockaddr_in));
+			if(iRet == -1) {
+				printf("udp bind error\n");
+				break;
+			}
+			printf("udp socket bind ok\n");
+
+			char rcvbuf[16] = { 0 };
+			int sock_len = sizeof(struct sockaddr_in);
+			while(1) {
+				int recvbytes = recvfrom(sock, rcvbuf, sizeof(rcvbuf), 0, (struct sockaddr*)&addrfrom, (socklen_t*)&sock_len);
+				if(recvbytes <= 0) {
+					printf("udp recvfrom error\n");
+				} else {
+					if(recvbytes >= sizeof(rcvbuf)) {
+						rcvbuf[sizeof(rcvbuf) - 1] = 0;
+					} else {
+						rcvbuf[recvbytes] = 0;
+					}
+					printf("udp recv:[%d],[%s]\n", recvbytes, rcvbuf);
+					printf("recv from: [%s:%d]\n", inet_ntoa(addrfrom.sin_addr), htons(addrfrom.sin_port));
+				}
+
+				vTaskDelay(10 / portTICK_RATE_MS);
+			}
+		} while(0);
+
+		close(sock);
+		vTaskDelay(10 / portTICK_RATE_MS);
 	}
 
 	vTaskDelete(NULL);
@@ -290,7 +428,7 @@ void ICACHE_FLASH_ATTR user_init(void)
 	rw_info rw;
 
 	uart_init_new();
-	//spi_flash_write_test(WIFI_BOARDCAST);
+	spi_flash_write_test(WIFI_BOARDCAST);
     printf("SDK version:%s\n", system_get_sdk_version());
 
 	if (spi_flash_read(FLASH_HEAD_ADDR, (uint32*) &rw, sizeof(rw))
@@ -301,6 +439,7 @@ void ICACHE_FLASH_ATTR user_init(void)
 		printf("spi_flash_read success\n");
 		iRet = 0;
 	}
+	xTaskCreate(gpio_test, "gpio_led", 256, (void*)&rw, 0, NULL);
 
 	/* need to set opmode before you set config */
 
@@ -316,6 +455,7 @@ void ICACHE_FLASH_ATTR user_init(void)
         wifi_station_set_config(config);
         free(config);
         xTaskCreate(client_mode, "client_mode", 256, NULL, 0, NULL);
+		xTaskCreate(udp_boardcast, "udp_boardcast", 256, NULL, 0, NULL);
     }
 	else
 	{
@@ -361,6 +501,4 @@ void ICACHE_FLASH_ATTR user_init(void)
 
 		xTaskCreate(wifi_mode, "wifi_mode", 256, NULL, 0, NULL);
 	}
-
-	xTaskCreate(gpio_test, "gpio_led", 256, (void*)&rw, 0, NULL);
 }
