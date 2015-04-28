@@ -30,6 +30,7 @@
 #define CLOUD_SERVER "211.155.86.145"
 #define CLOUD_PORT 10090
 #define MAX_PACK_LENGTH 99
+#define UDP_FINGERPRINT "I'm HERE, I'm iPLUG."
 
 
 enum DEV_TYPE {
@@ -50,6 +51,17 @@ typedef struct _rw_info{
 	uint8 run_mode;
 	uint8 dev_type;
 } rw_info;
+
+
+void rwinfo_init(rw_info* prw)
+{
+	memset(prw, 0, sizeof(rw_info));
+	prw->server_addr = inet_addr(CLOUD_SERVER);
+	prw->server_port = CLOUD_PORT;
+	prw->dev_type = DEV_PLUG;
+	strcpy(prw->ssid_mine, DEFAULT_SSID);
+	strcpy(prw->ssid_pwd_mine, DEFAULT_SSID_PWD);
+}
 
 
 void ICACHE_FLASH_ATTR raw_show(unsigned char* buf, size_t buflen)
@@ -96,6 +108,26 @@ void ICACHE_FLASH_ATTR show_sysinfo()
 	printf("RTC  TIME: [%d]\n", rtctime);
 	printf("SYS  TIME: [%d]\n", systime);
 	printf("==========SYS INFO==========\n");
+}
+
+uint8 ICACHE_FLASH_ATTR write_cfg_flash(rw_info* prw)
+{
+	//写入前，需要擦除
+	if (spi_flash_erase_sector(FLASH_HEAD_ADDR / (4 * 1024))
+			!= SPI_FLASH_RESULT_OK) {
+		printf("SPI FLASH ERASE ERROR\n");
+		return -1;
+	}
+	printf("SPI FLASH ERASE SUCCESS\n");
+
+	//写入
+	if (spi_flash_write(FLASH_HEAD_ADDR, (uint32*) prw, sizeof(rw_info))
+			!= SPI_FLASH_RESULT_OK) {
+		printf("SPI FLASH WRITE ERROR\n");
+	}
+	printf("SPI FLASH WRITE SUCCESS\n");
+
+	return 0;
 }
 
 
@@ -151,7 +183,6 @@ void ICACHE_FLASH_ATTR gpio_test(void* param)
 	int pin = 0;
 
 	rw_info* rw = (rw_info*)param;
-	show_rw(rw);
 
 	if(rw->run_mode == CLIENT_ONLY) {
 		pin = BIT12;
@@ -177,10 +208,12 @@ void ICACHE_FLASH_ATTR gpio_test(void* param)
 void ICACHE_FLASH_ATTR client_mode(void* param)
 {
 	printf("CLIENT MODE\n");
+	char rcvbuf[64];
 
 	while(1) {
 		int recvbytes, sin_size, str_len, sta_socket, iRet;
 		struct sockaddr_in local_ip, remote_ip;
+		memset(rcvbuf, 0, sizeof(rcvbuf));
 
 		sta_socket = socket(AF_INET, SOCK_STREAM, 0);
 		if(-1 == sta_socket) {
@@ -203,12 +236,77 @@ void ICACHE_FLASH_ATTR client_mode(void* param)
 			continue;
 		}
 		printf("Connected CLOUD :[%s:%d]\n", CLOUD_SERVER, CLOUD_PORT);
-		char* recv_buf = (char*)zalloc(128);
-		while((recvbytes = recv(sta_socket, recv_buf, 128, 0)) > 0) {
-			recv_buf[recvbytes] = 0;
-			printf("Data from CLIENT: [%d], [%s]\n", recvbytes, recv_buf);
+		//设备报告
+		rcvbuf[0] = 7;
+		rcvbuf[1] = 0;
+		int* pChipid = (int*)(rcvbuf + 2);
+		*pChipid = system_get_chip_id();
+		rcvbuf[6] = 1;
+		send(sta_socket, rcvbuf, 7, 0);
+		//循环读取
+
+		while(1) {
+			memset(rcvbuf, 0, sizeof(rcvbuf));
+			iRet = recv(sta_socket, rcvbuf, 1, 0);
+			if(iRet <= 0) {
+				printf("[%d] disconnected...\n", sta_socket);
+				close(sta_socket);
+				break;
+			}
+
+			if(rcvbuf[0] > MAX_PACK_LENGTH) {
+				printf("[%d] conn protocol error, max pack length overload\n", sta_socket);
+				close(sta_socket);
+				break;
+			}
+
+			iRet = recv(sta_socket, rcvbuf + 1, rcvbuf[0] - 1, 0);
+			if(iRet <= 0) {
+				printf("[%d] disconnected...\n", sta_socket);
+				close(sta_socket);
+				break;
+			}
+
+			switch(rcvbuf[1])
+			{
+			case 1:
+				//HEARTBEAT
+				printf("Heart beat req\n");
+				rcvbuf[0] = 2;
+				rcvbuf[1] = 5;
+				send(sta_socket, rcvbuf, 2, 0);
+				break;
+			case 4:
+				//dev rp rsp
+				printf("Dev RP RSP\n");
+				break;
+			case 8:
+			{
+				//LED TEST
+				printf("RECV LED TEST\n");
+				rcvbuf[0] = 2;
+				rcvbuf[1] = 9;
+				send(sta_socket, rcvbuf, 2, 0);
+				break;
+			}
+			case 12:
+			{
+				//RST
+				printf("REST \n");
+				rcvbuf[0] = 2;
+				rcvbuf[1] = 13;
+				send(sta_socket, rcvbuf, 2, 0);
+				vTaskDelay(50 / portTICK_RATE_MS);
+				close(sta_socket);
+				system_restart();
+				break;
+			}
+			default:
+				break;
+			}
+
+			printf("one pack proc over.\n");
 		}
-		free(recv_buf);
 
 		if(recvbytes <= 0) {
 			printf("disconnected...\n");
@@ -299,6 +397,13 @@ void ICACHE_FLASH_ATTR wifi_mode_client_conn(void* param)
 
 void ICACHE_FLASH_ATTR wifi_mode(void* param)
 {
+	rw_info rw;
+	char rcvbuf[64];
+	char* ssid = NULL;
+	char* ssid_pwd = NULL;
+
+	rwinfo_init(&rw);
+
 	while(1) {
 		struct sockaddr_in server_addr, client_addr;
 		int server_sock, client_sock, iRet;
@@ -339,9 +444,99 @@ void ICACHE_FLASH_ATTR wifi_mode(void* param)
 					printf("accept error\n");
 					continue;
 				}
-				printf("New connection from sock:[%d], addr: [%s:%d]\n", client_sock, inet_ntoa(client_addr.sin_addr), htons(client_addr.sin_port));
+				printf("New connection from sock:[%d], addr: [%s:%d]\n",
+						client_sock, inet_ntoa(client_addr.sin_addr), htons(client_addr.sin_port));
 
-				xTaskCreate(wifi_mode_client_conn, "wifi_mode_client_conn", 128, (void*)client_sock, 0, NULL);
+				while(1) {
+					memset(rcvbuf, 0, sizeof(rcvbuf));
+					iRet = recv(client_sock, rcvbuf, 1, 0);
+					if(iRet <= 0) {
+						printf("[%d] disconnected...\n", client_sock);
+						close(client_sock);
+						break;
+					}
+
+					if(rcvbuf[0] > MAX_PACK_LENGTH) {
+						printf("[%d] conn protocol error, max pack length overload\n", client_sock);
+						close(client_sock);
+						break;
+					}
+
+					iRet = recv(client_sock, rcvbuf + 1, rcvbuf[0] - 1, 0);
+					if(iRet <= 0) {
+						printf("[%d] disconnected...\n", client_sock);
+						close(client_sock);
+						break;
+					}
+
+					switch(rcvbuf[1])
+					{
+					case 1:
+						//HEARTBEAT
+						printf("Heart beat req\n");
+						rcvbuf[0] = 2;
+						rcvbuf[1] = 5;
+						send(client_sock, rcvbuf, 2, 0);
+						break;
+					case 8:
+					{
+						//LED TEST
+						printf("RECV LED TEST\n");
+						rcvbuf[0] = 2;
+						rcvbuf[1] = 9;
+						send(client_sock, rcvbuf, 2, 0);
+						break;
+					}
+					case 10:
+					{
+						//SET SSID
+						printf("set ssid req\n");
+						ssid = rcvbuf + 2;
+						if(strlen(ssid) >= 32 || strlen(ssid) <= 0) {
+							printf("ssid large than 32 byte.\n");
+							close(client_sock);
+							break;
+						}
+
+						ssid_pwd = rcvbuf + 2 + strlen(ssid) + 1;
+						if(strlen(ssid_pwd) >= 32 || strlen(ssid_pwd) <= 0) {
+							printf("ssid_pwd large than 32 byte.\n");
+							close(client_sock);
+							break;
+						}
+
+						strcpy(rw.ssid, ssid);
+						strcpy(rw.ssid_pwd, ssid_pwd);
+						rw.run_mode = CLIENT_ONLY;
+						if(write_cfg_flash(&rw) < 0) {
+							printf("write_cfg_flash error\n");
+						}
+
+						rcvbuf[0] = 2;
+						rcvbuf[1] = 11;
+						send(client_sock, rcvbuf, 2, 0);
+
+						break;
+					}
+					case 12:
+					{
+						//RST
+						printf("REST \n");
+						rcvbuf[0] = 2;
+						rcvbuf[1] = 13;
+						send(client_sock, rcvbuf, 2, 0);
+						vTaskDelay(50 / portTICK_RATE_MS);
+						close(client_sock);
+						system_restart();
+						break;
+					}
+					default:
+						break;
+					}
+
+					printf("one pack proc over.\n");
+				}
+				//xTaskCreate(wifi_mode_client_conn, "wifi_mode_client_conn", 128, (void*)client_sock, 0, NULL);
 			}
 
 		} while(0);
@@ -408,6 +603,10 @@ void ICACHE_FLASH_ATTR udp_boardcast(void* param)
 					}
 					printf("udp recv:[%d],[%s]\n", recvbytes, rcvbuf);
 					printf("recv from: [%s:%d]\n", inet_ntoa(addrfrom.sin_addr), htons(addrfrom.sin_port));
+
+					printf("I'm HERE\n");
+					sock_len = sizeof(addrfrom);
+					sendto(sock, UDP_FINGERPRINT, strlen(UDP_FINGERPRINT), 0, (struct sockaddr*)&addrfrom, sock_len);
 				}
 
 				vTaskDelay(10 / portTICK_RATE_MS);
@@ -425,13 +624,13 @@ void ICACHE_FLASH_ATTR udp_boardcast(void* param)
 void ICACHE_FLASH_ATTR user_init(void)
 {
 	uint8 iRet;
-	rw_info rw;
+	rw_info* prw = (rw_info*)zalloc(sizeof(rw_info));
 
 	uart_init_new();
-	spi_flash_write_test(WIFI_BOARDCAST);
-    printf("SDK version:%s\n", system_get_sdk_version());
+	//spi_flash_write_test(WIFI_BOARDCAST);
+	show_sysinfo();
 
-	if (spi_flash_read(FLASH_HEAD_ADDR, (uint32*) &rw, sizeof(rw))
+	if (spi_flash_read(FLASH_HEAD_ADDR, (uint32*) prw, sizeof(rw_info))
 			!= SPI_FLASH_RESULT_OK) {
 		printf("spi_flash_read error\n");
 		iRet = -1;
@@ -439,16 +638,17 @@ void ICACHE_FLASH_ATTR user_init(void)
 		printf("spi_flash_read success\n");
 		iRet = 0;
 	}
-	xTaskCreate(gpio_test, "gpio_led", 256, (void*)&rw, 0, NULL);
+	show_rw(prw);
+	xTaskCreate(gpio_test, "gpio_led", 256, (void*)prw, 0, NULL);
 
 	/* need to set opmode before you set config */
 
-	if(rw.run_mode == CLIENT_ONLY)
+	if(prw->run_mode == CLIENT_ONLY)
     {
 		wifi_set_opmode(STATION_MODE);
         struct station_config *config = (struct station_config *)zalloc(sizeof(struct station_config));
-        sprintf(config->ssid, "useease2");
-        sprintf(config->password, "1CBE991A14");
+        sprintf(config->ssid, prw->ssid);
+        sprintf(config->password, prw->ssid_pwd);
 
         /* need to sure that you are in station mode first,
          * otherwise it will be failed. */
@@ -456,6 +656,7 @@ void ICACHE_FLASH_ATTR user_init(void)
         free(config);
         xTaskCreate(client_mode, "client_mode", 256, NULL, 0, NULL);
 		xTaskCreate(udp_boardcast, "udp_boardcast", 256, NULL, 0, NULL);
+		xTaskCreate(wifi_mode, "wifi_mode", 256, NULL, 0, NULL);
     }
 	else
 	{
